@@ -40,3 +40,4 @@ jobs:
           git add gold_alert_state.json
           git diff --staged --quiet || git commit -m "Update signal state"
           git push
+#v2
