@@ -1,0 +1,42 @@
+name: Gold Scalp Alert
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub runs scheduled jobs on a best-effort basis,
+    # so during busy periods this can lag by a few extra minutes — normal.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated state file
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run signal check
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: python gold_scalp_alert_cloud.py
+
+      - name: Save updated state back to the repo
+        run: |
+          git config user.name "gold-alert-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add gold_alert_state.json
+          git diff --staged --quiet || git commit -m "Update signal state"
+          git push
