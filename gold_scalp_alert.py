@@ -1,12 +1,14 @@
 """
-XAU/USD 30-minute scalp signal alert — GitHub Actions version.
+XAU/USD 30-minute scalp signal alert.
 
-Same logic as the Mac version, including the trend-following setup, the
-counter-trend fade setup, automatic open-trade tracking, and the
-breakeven/partial-profit milestone nudge. Credentials come from
-environment variables (GitHub Secrets) instead of a local config file.
-The workflow that runs this script commits gold_alert_state.json back to
-the repo after each run, so the tracker's memory survives between runs.
+Run this a few times a day (via cron or Task Scheduler — see setup notes below).
+Each run:
+  1. Pulls the latest 5-minute gold price bars.
+  2. Computes the same Long / Short / No trade setup as the dashboard
+     (EMA9/21 trend + RSI filter + ATR-sized stop loss and take profit).
+  3. Emails you immediately if the setup changed since the last run.
+  4. Sends one daily summary regardless, so you know the checker is alive
+     even when nothing has changed.
 
 Requires: pip install requests
 """
@@ -19,10 +21,12 @@ from datetime import datetime, date
 from email.message import EmailMessage
 
 import requests
-TWELVE_DATA_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
-GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-TO_EMAIL = os.environ["TO_EMAIL"]
+from gold_alert_config import (
+    TWELVE_DATA_API_KEY,
+    GMAIL_ADDRESS,
+    GMAIL_APP_PASSWORD,
+    TO_EMAIL,
+)
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "gold_alert_state.json")
 PAUSE_FLAG = os.path.join(os.path.dirname(__file__), "in_trade")
