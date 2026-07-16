@@ -1,12 +1,14 @@
 """
 XAU/USD 30-minute scalp signal alert — GitHub Actions version.
 
-Same logic as the Mac version, including the trend-following setup, the
-counter-trend fade setup, automatic open-trade tracking, and the
-breakeven/partial-profit milestone nudge. Credentials come from
-environment variables (GitHub Secrets) instead of a local config file.
-The workflow that runs this script commits gold_alert_state.json back to
-the repo after each run, so the tracker's memory survives between runs.
+Same logic as the Mac version: trend setup, counter-trend fade setup,
+automatic open-trade tracking with THREE scaled take-profit levels
+(TP1 closes 1/3 + moves stop to breakeven, TP2 closes another 1/3, TP3
+closes the rest), and permanent running performance stats (win rate,
+expectancy in R-multiples) in every update email. Credentials come from
+environment variables (GitHub Secrets). The workflow commits
+gold_alert_state.json back to the repo after each run, so trade history
+and open positions survive between runs.
 
 Requires: pip install requests
 """
@@ -150,7 +152,8 @@ def build_setup(d, prev):
 
     entry = d["close"]
     buffer = d["atr"] * 0.15
-    stop_mult, target_mult = 1.5, 2.25
+    stop_mult = 1.5
+    tp1_mult, tp2_mult, tp3_mult = 1.0, 2.25, 3.5
 
     setup = {
         "bias": bias,
@@ -159,14 +162,20 @@ def build_setup(d, prev):
         "entry_low": round(entry - buffer, 2),
         "entry_high": round(entry + buffer, 2),
         "stop_loss": None,
-        "take_profit": None,
+        "tp1": None,
+        "tp2": None,
+        "tp3": None,
     }
     if bias == "Long":
         setup["stop_loss"] = round(entry - d["atr"] * stop_mult, 2)
-        setup["take_profit"] = round(entry + d["atr"] * target_mult, 2)
+        setup["tp1"] = round(entry + d["atr"] * tp1_mult, 2)
+        setup["tp2"] = round(entry + d["atr"] * tp2_mult, 2)
+        setup["tp3"] = round(entry + d["atr"] * tp3_mult, 2)
     elif bias == "Short":
         setup["stop_loss"] = round(entry + d["atr"] * stop_mult, 2)
-        setup["take_profit"] = round(entry - d["atr"] * target_mult, 2)
+        setup["tp1"] = round(entry - d["atr"] * tp1_mult, 2)
+        setup["tp2"] = round(entry - d["atr"] * tp2_mult, 2)
+        setup["tp3"] = round(entry - d["atr"] * tp3_mult, 2)
 
     return setup
 
@@ -203,7 +212,8 @@ def build_fade_setup(d, prev):
 
     entry = d["close"]
     buffer = d["atr"] * 0.15
-    stop_mult, target_mult = 1.0, 1.5  # tighter than trend setups — lower-probability trades
+    stop_mult = 1.0  # tighter than trend setups — lower-probability trades
+    tp1_mult, tp2_mult, tp3_mult = 0.75, 1.5, 2.25
 
     setup = {
         "bias": bias,
@@ -212,96 +222,213 @@ def build_fade_setup(d, prev):
         "entry_low": round(entry - buffer, 2),
         "entry_high": round(entry + buffer, 2),
         "stop_loss": None,
-        "take_profit": None,
+        "tp1": None,
+        "tp2": None,
+        "tp3": None,
     }
     if bias == "Long":
         setup["stop_loss"] = round(entry - d["atr"] * stop_mult, 2)
-        setup["take_profit"] = round(entry + d["atr"] * target_mult, 2)
+        setup["tp1"] = round(entry + d["atr"] * tp1_mult, 2)
+        setup["tp2"] = round(entry + d["atr"] * tp2_mult, 2)
+        setup["tp3"] = round(entry + d["atr"] * tp3_mult, 2)
     elif bias == "Short":
         setup["stop_loss"] = round(entry + d["atr"] * stop_mult, 2)
-        setup["take_profit"] = round(entry - d["atr"] * target_mult, 2)
+        setup["tp1"] = round(entry - d["atr"] * tp1_mult, 2)
+        setup["tp2"] = round(entry - d["atr"] * tp2_mult, 2)
+        setup["tp3"] = round(entry - d["atr"] * tp3_mult, 2)
 
     return setup
 
 
-# ---------- Open trade tracking ----------
+# ---------- Running performance stats ----------
+def record_resolved_trade(state, ot, outcome, r_multiple):
+    """Append this fully-closed trade to a permanent history log. r_multiple
+    is the final weighted result across all partial exits, computed by the
+    caller (check_open_trade), so running stats reflect real scaled-out
+    outcomes rather than a single all-or-nothing exit."""
+    history = state.setdefault("trade_history", [])
+    history.append(
+        {
+            "strategy": ot.get("strategy", "trend"),
+            "bias": ot["bias"],
+            "outcome": outcome,
+            "r_multiple": round(r_multiple, 2),
+            "opened_at": ot.get("opened_at"),
+            "resolved_at": datetime.now().isoformat(),
+        }
+    )
+    return round(r_multiple, 2)
+
+
+def compute_stats(history, strategy=None):
+    rows = [h for h in history if strategy is None or h["strategy"] == strategy]
+    if not rows:
+        return None
+    wins = [h["r_multiple"] for h in rows if h["r_multiple"] > 0]
+    losses = [h["r_multiple"] for h in rows if h["r_multiple"] <= 0]
+    win_rate = round(len(wins) / len(rows) * 100, 1)
+    avg_win = round(sum(wins) / len(wins), 2) if wins else 0
+    avg_loss = round(sum(losses) / len(losses), 2) if losses else 0
+    expectancy = round(sum(h["r_multiple"] for h in rows) / len(rows), 2)
+    return {
+        "count": len(rows),
+        "win_rate": win_rate,
+        "avg_win_r": avg_win,
+        "avg_loss_r": avg_loss,
+        "expectancy_r": expectancy,
+    }
+
+
+def format_stats_block(state):
+    history = state.get("trade_history", [])
+    overall = compute_stats(history)
+    if not overall:
+        return "\nRunning stats: no resolved trades logged yet."
+
+    trend_stats = compute_stats(history, "trend")
+    fade_stats = compute_stats(history, "fade")
+
+    lines = [
+        f"\nRunning stats ({overall['count']} resolved trades):",
+        f"  Overall: {overall['win_rate']}% win rate, avg win {overall['avg_win_r']}R, "
+        f"avg loss {overall['avg_loss_r']}R, expectancy {overall['expectancy_r']}R per trade",
+    ]
+    if trend_stats:
+        lines.append(
+            f"  Trend only ({trend_stats['count']}): {trend_stats['win_rate']}% win rate, "
+            f"expectancy {trend_stats['expectancy_r']}R"
+        )
+    if fade_stats:
+        lines.append(
+            f"  Fade only ({fade_stats['count']}): {fade_stats['win_rate']}% win rate, "
+            f"expectancy {fade_stats['expectancy_r']}R"
+        )
+    lines.append(
+        "  (Breakeven expectancy is 0R — anything consistently above 0 after enough "
+        "trades suggests real edge; below 0 suggests there isn't one yet.)"
+    )
+    return "\n".join(lines)
 def check_open_trade(state, current):
-    """If there's an open trade logged, see if this candle resolved it
-    (stop hit, target hit, or invalidated on a close back through entry),
-    or if it's crossed a profit milestone worth flagging (breakeven/partial
-    profit consideration) before any hard invalidation.
+    """If there's an open trade logged, walk it through up to three scaled
+    take-profit levels:
+      - TP1 hit: close 1/3, move the effective stop to breakeven for the rest.
+      - TP2 hit: close another 1/3, stop stays at breakeven.
+      - TP3 hit: close the final 1/3 — trade fully resolved.
+      - Stop hit before TP1: full loss, resolved.
+      - Stop (now at breakeven) hit after TP1 but before TP2/TP3: resolved
+        with a partial win already locked in from TP1.
+      - Invalidated: only checked before TP1, since once the stop is at
+        breakeven the "invalidation" concept is already covered by that.
     Returns True if a trade is open after this check (whether just resolved,
-    just flagged, or still quietly running)."""
+    just partially closed, or still quietly running)."""
     ot = state.get("open_trade")
     if not ot:
         return False
 
-    outcome = None
-    if ot["bias"] == "Long":
-        if current["low"] <= ot["stop_loss"]:
-            outcome = "Stopped out"
-        elif current["high"] >= ot["take_profit"]:
-            outcome = "Target hit"
-        elif current["close"] < ot["entry_low"]:
-            outcome = "Invalidated"
-    else:  # Short
-        if current["high"] >= ot["stop_loss"]:
-            outcome = "Stopped out"
-        elif current["low"] <= ot["take_profit"]:
-            outcome = "Target hit"
-        elif current["close"] > ot["entry_high"]:
-            outcome = "Invalidated"
+    tp1_hit = ot.get("tp1_hit", False)
+    tp2_hit = ot.get("tp2_hit", False)
+    realized_r = ot.get("realized_r", 0.0)
+    entry_mid = (ot["entry_low"] + ot["entry_high"]) / 2
+    risk = abs(entry_mid - ot["stop_loss"])
+    is_long = ot["bias"] == "Long"
 
-    if outcome:
+    # Effective stop: original stop until TP1 hits, then breakeven (entry).
+    effective_stop = entry_mid if tp1_hit else ot["stop_loss"]
+
+    def r_at(price):
+        move = (price - entry_mid) if is_long else (entry_mid - price)
+        return move / risk if risk else 0
+
+    stopped = (current["low"] <= effective_stop) if is_long else (current["high"] >= effective_stop)
+    hit_tp1 = (not tp1_hit) and ((current["high"] >= ot["tp1"]) if is_long else (current["low"] <= ot["tp1"]))
+    hit_tp2 = tp1_hit and (not tp2_hit) and ((current["high"] >= ot["tp2"]) if is_long else (current["low"] <= ot["tp2"]))
+    hit_tp3 = tp1_hit and tp2_hit and ((current["high"] >= ot["tp3"]) if is_long else (current["low"] <= ot["tp3"]))
+    invalidated = (not tp1_hit) and (
+        (current["close"] < ot["entry_low"]) if is_long else (current["close"] > ot["entry_high"])
+    )
+
+    # Stop / breakeven-stop hit — trade fully closes here.
+    if stopped:
+        this_leg_r = r_at(effective_stop)
+        remaining_share = 1.0 if not tp1_hit else (2 / 3 if not tp2_hit else 1 / 3)
+        final_r = realized_r + remaining_share * this_leg_r
+        outcome = "Stopped out" if not tp1_hit else "Remainder stopped at breakeven (TP1 already secured)"
+        record_resolved_trade(state, ot, outcome, final_r)
         body = (
             f"Trade: {ot['bias']} (entered {ot['entry_low']}-{ot['entry_high']})\n"
-            f"Outcome: {outcome}\n"
+            f"Outcome: {outcome} ({final_r:+.2f}R)\n"
             f"Current price: {current['close']}\n"
-            f"Stop loss was: {ot['stop_loss']}\n"
-            f"Take profit was: {ot['take_profit']}\n"
         )
-        if outcome == "Invalidated":
-            body += (
-                "\nPrice closed back through your entry range without reaching "
-                "stop or target. The setup's own logic considers this trade's "
-                "premise gone, independent of where price goes next."
-            )
+        body += format_stats_block(state)
         send_email(f"Gold trade update: {outcome}", body)
-        print(f"[{datetime.now()}] Open trade resolved: {outcome}")
+        print(f"[{datetime.now()}] Trade resolved: {outcome} ({final_r:+.2f}R)")
         state["open_trade"] = None
         return True
 
-    # Not resolved — check how far toward target this trade has gotten,
-    # so we can flag a breakeven/partial-profit moment before any hard call.
-    entry_mid = (ot["entry_low"] + ot["entry_high"]) / 2
-    if ot["bias"] == "Long":
-        progress = (current["close"] - entry_mid) / (ot["take_profit"] - entry_mid)
-    else:
-        progress = (entry_mid - current["close"]) / (entry_mid - ot["take_profit"])
-
-    milestone_threshold = 0.4  # 40% of the way from entry to target
-    if progress >= milestone_threshold and not ot.get("milestone_sent") and progress < 1:
-        pct = round(progress * 100)
+    if invalidated:
+        this_leg_r = r_at(current["close"])
+        record_resolved_trade(state, ot, "Invalidated", this_leg_r)
         body = (
             f"Trade: {ot['bias']} (entered {ot['entry_low']}-{ot['entry_high']})\n"
-            f"Current price: {current['close']}\n"
-            f"Roughly {pct}% of the way from entry to your take profit "
-            f"({ot['take_profit']}).\n\n"
-            "This is a natural point to consider two options, entirely your call:\n"
-            "- Move your stop loss up to your entry price (breakeven), so a "
-            "reversal can no longer turn this into a loss.\n"
-            "- Take partial profit now and let the rest ride toward the "
-            "original target.\n\n"
-            "Not trading advice — just flagging that you're meaningfully in "
-            "profit before any invalidation call would trigger."
+            f"Outcome: Invalidated ({this_leg_r:+.2f}R)\n"
+            f"Current price: {current['close']}\n\n"
+            "Price closed back through your entry range without reaching TP1 or "
+            "stop. The setup's own logic considers this trade's premise gone."
         )
-        send_email("Gold trade update: consider breakeven or partial profit", body)
-        ot["milestone_sent"] = True
-        state["open_trade"] = ot
-        print(f"[{datetime.now()}] Sent breakeven/partial-profit nudge at {pct}% progress.")
-    else:
-        print(f"[{datetime.now()}] Still in open trade ({ot['bias']}), no resolution yet.")
+        body += format_stats_block(state)
+        send_email("Gold trade update: Invalidated", body)
+        print(f"[{datetime.now()}] Trade resolved: Invalidated ({this_leg_r:+.2f}R)")
+        state["open_trade"] = None
+        return True
 
+    if hit_tp3:
+        this_leg_r = r_at(ot["tp3"])
+        final_r = realized_r + (1 / 3) * this_leg_r
+        record_resolved_trade(state, ot, "Fully closed at TP3", final_r)
+        body = (
+            f"Trade: {ot['bias']} (entered {ot['entry_low']}-{ot['entry_high']})\n"
+            f"Outcome: Fully closed at TP3 ({final_r:+.2f}R)\n"
+            f"Current price: {current['close']}\n\n"
+            "Final third closed at TP3 — full target range achieved."
+        )
+        body += format_stats_block(state)
+        send_email("Gold trade update: TP3 hit, fully closed", body)
+        print(f"[{datetime.now()}] Trade resolved: TP3 ({final_r:+.2f}R)")
+        state["open_trade"] = None
+        return True
+
+    if hit_tp2:
+        this_leg_r = r_at(ot["tp2"])
+        ot["realized_r"] = realized_r + (1 / 3) * this_leg_r
+        ot["tp2_hit"] = True
+        state["open_trade"] = ot
+        send_email(
+            "Gold trade update: TP2 hit, take another 1/3",
+            f"Trade: {ot['bias']} (entered {ot['entry_low']}-{ot['entry_high']})\n"
+            f"TP2 hit at {ot['tp2']}. Take another 1/3 profit here.\n"
+            f"Stop stays at breakeven ({entry_mid:.2f}) for the final 1/3, "
+            f"which now rides toward TP3 ({ot['tp3']}).",
+        )
+        print(f"[{datetime.now()}] TP2 hit, took another 1/3.")
+        return True
+
+    if hit_tp1:
+        this_leg_r = r_at(ot["tp1"])
+        ot["realized_r"] = realized_r + (1 / 3) * this_leg_r
+        ot["tp1_hit"] = True
+        state["open_trade"] = ot
+        send_email(
+            "Gold trade update: TP1 hit, take 1/3 + move to breakeven",
+            f"Trade: {ot['bias']} (entered {ot['entry_low']}-{ot['entry_high']})\n"
+            f"TP1 hit at {ot['tp1']}. Take 1/3 profit here.\n"
+            f"Move your stop on the remaining 2/3 to breakeven ({entry_mid:.2f}) — "
+            f"from this point, this trade can no longer become a net loss.\n"
+            f"Remaining targets: TP2 {ot['tp2']}, TP3 {ot['tp3']}.",
+        )
+        print(f"[{datetime.now()}] TP1 hit, took 1/3, moved stop to breakeven.")
+        return True
+
+    print(f"[{datetime.now()}] Still in open trade ({ot['bias']}), no level hit yet.")
     return True
 
 
@@ -346,13 +473,15 @@ def format_setup_body(setup, price):
             f"Action: {action}",
             f"Entry range: {setup['entry_low']} - {setup['entry_high']}",
             f"Stop loss: {setup['stop_loss']}",
-            f"Take profit: {setup['take_profit']}",
-            "Invalidation: if price closes back through the entry range without "
-            "hitting stop or target, the setup's premise is considered gone.",
+            f"TP1: {setup['tp1']}  (close 1/3, move stop to breakeven)",
+            f"TP2: {setup['tp2']}  (close another 1/3, stop stays at breakeven)",
+            f"TP3: {setup['tp3']}  (close the final 1/3 — trade fully done)",
+            "Invalidation: if price closes back through the entry range before "
+            "TP1 is reached, the setup's premise is considered gone.",
             "\nThis will be tracked automatically from here: you'll get an email "
-            "if it moves meaningfully into profit (with a breakeven/partial-profit "
-            "prompt), and another when it finally resolves. If you don't actually "
-            "take this trade, just ignore those follow-ups.",
+            "at each TP as it's hit (with what to do), and a final one when the "
+            "trade fully resolves. If you don't actually take this trade, just "
+            "ignore those follow-ups.",
         ]
     lines.append(
         "\nNot trading advice — a rule-based read sized to recent volatility (ATR). "
@@ -396,7 +525,7 @@ def main():
         # Automatically start tracking this as your open trade — no manual
         # step needed. If you don't actually take it, just ignore the
         # follow-up emails; the tracker will still resolve and clear itself.
-        state["open_trade"] = {**setup, "opened_at": datetime.now().isoformat(), "milestone_sent": False}
+        state["open_trade"] = {**setup, "opened_at": datetime.now().isoformat(), "tp1_hit": False, "tp2_hit": False, "realized_r": 0.0}
         print(f"[{datetime.now()}] Sent trend trade alert and started auto-tracking: {setup['bias']}")
 
     # Fade (counter-trend) check: only look for a pullback opportunity when
@@ -419,7 +548,7 @@ def main():
                 f"Gold trade worth taking: {fade_setup['bias']} (fade)",
                 format_setup_body(fade_setup, current["close"]),
             )
-            state["open_trade"] = {**fade_setup, "opened_at": datetime.now().isoformat(), "milestone_sent": False}
+            state["open_trade"] = {**fade_setup, "opened_at": datetime.now().isoformat(), "tp1_hit": False, "tp2_hit": False, "realized_r": 0.0}
             print(f"[{datetime.now()}] Sent fade trade alert and started auto-tracking: {fade_setup['bias']}")
 
         state["last_fade_bias"] = fade_setup["bias"]
@@ -427,7 +556,7 @@ def main():
     if is_first_run_today:
         send_email(
             f"Gold signal — daily summary: {setup['bias']}",
-            format_setup_body(setup, current["close"]),
+            format_setup_body(setup, current["close"]) + format_stats_block(state),
         )
         state["last_digest_date"] = today_str
         print(f"[{datetime.now()}] Sent daily summary: {setup['bias']}")
