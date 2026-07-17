@@ -1,14 +1,13 @@
 """
 XAU/USD 30-minute scalp signal alert — GitHub Actions version.
 
-Same logic as the Mac version: trend setup, counter-trend fade setup,
-automatic open-trade tracking with THREE scaled take-profit levels
-(TP1 closes 1/3 + moves stop to breakeven, TP2 closes another 1/3, TP3
-closes the rest), and permanent running performance stats (win rate,
-expectancy in R-multiples) in every update email. Credentials come from
-environment variables (GitHub Secrets). The workflow commits
-gold_alert_state.json back to the repo after each run, so trade history
-and open positions survive between runs.
+Same logic as the Mac version: trend setup, counter-trend fade setup, an
+ADX-based regime filter (trend signals only fire when the market is
+genuinely trending; fade signals only fire when it's genuinely ranging),
+automatic open-trade tracking with three scaled take-profit levels, and
+permanent running performance stats. Credentials come from environment
+variables (GitHub Secrets). The workflow commits gold_alert_state.json
+back to the repo after each run.
 
 Requires: pip install requests
 """
@@ -111,17 +110,74 @@ def atr(series, period=14):
     return ema(trs, period)
 
 
+def wilder_smooth(values, period):
+    out = [0.0] * len(values)
+    if len(values) <= period:
+        return out
+    s = sum(values[1:period + 1])
+    out[period] = s
+    for i in range(period + 1, len(values)):
+        s = s - (s / period) + values[i]
+        out[i] = s
+    return out
+
+
+def adx(series, period=14):
+    """Average Directional Index: measures trend STRENGTH regardless of
+    direction. High ADX = genuinely trending market. Low ADX = ranging/chop.
+    Used as a regime filter so trend and fade signals only fire in the
+    market conditions they're actually built for, instead of both
+    competing under identical rules all the time."""
+    plus_dm = [0.0]
+    minus_dm = [0.0]
+    trs = [series[0]["high"] - series[0]["low"]]
+    for i in range(1, len(series)):
+        up_move = series[i]["high"] - series[i - 1]["high"]
+        down_move = series[i - 1]["low"] - series[i]["low"]
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0.0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0.0)
+        prev_close = series[i - 1]["close"]
+        tr = max(
+            series[i]["high"] - series[i]["low"],
+            abs(series[i]["high"] - prev_close),
+            abs(series[i]["low"] - prev_close),
+        )
+        trs.append(tr)
+
+    s_tr = wilder_smooth(trs, period)
+    s_plus = wilder_smooth(plus_dm, period)
+    s_minus = wilder_smooth(minus_dm, period)
+
+    plus_di = [100 * s_plus[i] / s_tr[i] if s_tr[i] else 0 for i in range(len(trs))]
+    minus_di = [100 * s_minus[i] / s_tr[i] if s_tr[i] else 0 for i in range(len(trs))]
+    dx = [
+        100 * abs(plus_di[i] - minus_di[i]) / (plus_di[i] + minus_di[i])
+        if (plus_di[i] + minus_di[i]) else 0
+        for i in range(len(trs))
+    ]
+
+    adx_vals = [0.0] * len(dx)
+    start = period * 2
+    if len(dx) > start:
+        adx_vals[start] = sum(dx[period:start]) / period
+        for i in range(start + 1, len(dx)):
+            adx_vals[i] = (adx_vals[i - 1] * (period - 1) + dx[i]) / period
+    return adx_vals
+
+
 def compute_all(series):
     closes = [d["close"] for d in series]
     ema9 = ema(closes, 9)
     ema21 = ema(closes, 21)
     rsi_vals = rsi(closes, 14)
     atr_vals = atr(series, 14)
+    adx_vals = adx(series, 14)
     for i, d in enumerate(series):
         d["ema9"] = ema9[i]
         d["ema21"] = ema21[i]
         d["rsi"] = rsi_vals[i]
         d["atr"] = atr_vals[i]
+        d["adx"] = adx_vals[i]
     return series
 
 
@@ -459,7 +515,7 @@ def send_email(subject, body):
         server.send_message(msg)
 
 
-def format_setup_body(setup, price):
+def format_setup_body(setup, price, adx_value=None, regime=None):
     strategy_label = "Counter-trend fade (lower probability, tighter target)" if setup.get("strategy") == "fade" else "Trend continuation"
     lines = [
         f"XAU/USD price: {price}",
@@ -467,6 +523,8 @@ def format_setup_body(setup, price):
         f"Setup: {setup['bias']}",
         f"Reason: {setup['reason']}",
     ]
+    if adx_value is not None:
+        lines.append(f"Regime: {regime} (ADX {adx_value:.1f})")
     if setup["bias"] != "No trade":
         action = "BUY" if setup["bias"] == "Long" else "SELL"
         lines += [
@@ -497,6 +555,18 @@ def main():
     current = series[-1]
     setup = build_setup(current, prev)
 
+    # Regime filter: ADX measures trend strength regardless of direction.
+    # >= 20 is the standard threshold for "genuinely trending." Below that,
+    # a trend signal is more likely to be noise/chop dressed up as a trend —
+    # so it gets held back rather than fired into conditions it's not built for.
+    regime = "Trending" if current["adx"] >= 20 else "Ranging"
+    if setup["bias"] in ("Long", "Short") and regime != "Trending":
+        setup["bias"] = "No trade"
+        setup["reason"] = (
+            f"Regime filter: ADX is {current['adx']:.1f}, suggesting ranging "
+            f"conditions — holding back this trend signal to avoid trading into chop."
+        )
+
     state = load_state()
     today_str = date.today().isoformat()
 
@@ -520,7 +590,7 @@ def main():
     elif is_new_actionable_setup:
         send_email(
             f"Gold trade worth taking: {setup['bias']} (trend)",
-            format_setup_body(setup, current["close"]),
+            format_setup_body(setup, current["close"], current["adx"], regime),
         )
         # Automatically start tracking this as your open trade — no manual
         # step needed. If you don't actually take it, just ignore the
@@ -529,11 +599,13 @@ def main():
         print(f"[{datetime.now()}] Sent trend trade alert and started auto-tracking: {setup['bias']}")
 
     # Fade (counter-trend) check: only look for a pullback opportunity when
-    # the trend system itself found nothing, and nothing else is being tracked.
-    # This keeps the two strategies from ever firing on the same candle.
+    # the trend system itself found nothing, the regime confirms we're
+    # actually ranging (not just an early/weak trend), and nothing else is
+    # being tracked. Fading a confirmed real trend is the riskiest case, so
+    # fade signals are held back entirely while ADX says "Trending."
     fade_setup = None
     is_new_fade_setup = False
-    if setup["bias"] == "No trade" and not trade_was_open:
+    if setup["bias"] == "No trade" and not trade_was_open and regime == "Ranging":
         fade_setup = build_fade_setup(current, prev)
         fade_changed = fade_setup["bias"] != state.get("last_fade_bias")
         is_new_fade_setup = fade_changed and fade_setup["bias"] in ("Long", "Short")
@@ -546,7 +618,7 @@ def main():
         elif is_new_fade_setup:
             send_email(
                 f"Gold trade worth taking: {fade_setup['bias']} (fade)",
-                format_setup_body(fade_setup, current["close"]),
+                format_setup_body(fade_setup, current["close"], current["adx"], regime),
             )
             state["open_trade"] = {**fade_setup, "opened_at": datetime.now().isoformat(), "tp1_hit": False, "tp2_hit": False, "realized_r": 0.0}
             print(f"[{datetime.now()}] Sent fade trade alert and started auto-tracking: {fade_setup['bias']}")
@@ -556,7 +628,7 @@ def main():
     if is_first_run_today:
         send_email(
             f"Gold signal — daily summary: {setup['bias']}",
-            format_setup_body(setup, current["close"]) + format_stats_block(state),
+            format_setup_body(setup, current["close"], current["adx"], regime) + format_stats_block(state),
         )
         state["last_digest_date"] = today_str
         print(f"[{datetime.now()}] Sent daily summary: {setup['bias']}")
