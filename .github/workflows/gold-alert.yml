@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write   # needed so the workflow can commit the updated state file
+concurrency: group: gold-scalp-alert cancel-in-progress: false  
 
 jobs:
   check-signal:
